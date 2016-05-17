@@ -1,0 +1,79 @@
+#!/usr/bin/env perl
+use Modern::Perl;
+use Image::ExifTool;
+use Geo::Coder::OSM;
+use JSON;
+use Getopt::Long;
+my $dir;
+my $re = qr{\d+\.JPG$};
+my $verbose;
+my $help;
+GetOptions("dir=s" => \$dir,
+	   "re=s" => \$re,
+	   "verbose" => \$verbose,
+	   "help" => \$help);
+die q{Usage: rename-pictures --dir=Pictures/2016
+
+The --dir option is mandatory and identifies the directory to work upon. It
+does not recurse. Use find(1) if you need this.
+
+Only files matching the regular expression \d+\.JPG$ are renamed by default.
+You can change the regular expression using the --re option:
+
+  --re='_\d+\.JPG$'
+
+You can switch on verbose output using --verbose.
+
+} if $help or not $dir;
+my $count = 0;
+my $renamed = 0;
+die "Directory $dir does not exist\n" unless -d $dir;
+opendir(my $dh, $dir) or die "Cannot open $dir: $!";
+my $exifTool = Image::ExifTool->new;
+$exifTool->Options(CoordFormat => q{%+.6f},
+		   DateFormat => "%Y-%m-%d %H:%M:%S");
+my $geocoder = Geo::Coder::OSM->new;
+my %cache;
+for my $file (readdir($dh)) {
+  next unless $file =~ /$re/;
+  $count++;
+  die "Cannot read $dir/$file" unless -f "$dir/$file";
+  say "$dir/$file" if $verbose;
+  $exifTool->ExtractInfo("$dir/$file");
+  # Date
+  my $date = $exifTool->GetValue('CreateDate', '');
+  if (!$date) {
+    warn "No CreateDate in these tags: "
+	. join(', ', $exifTool->GetFoundTags('File')) . "\n" if $verbose;
+    next;
+  }
+  # City
+  my $lat = $exifTool->GetValue('GPSLatitude', '');
+  my $long = $exifTool->GetValue('GPSLongitude', '');
+  if (!$lat or !$long) {
+    warn "No lat/long in these tags: "
+	. join(', ', $exifTool->GetFoundTags('File')) . "\n" if $verbose;
+    next;
+  }
+  my $city = $cache{"$lat/$long"};
+  if (!$city) {
+    say "geolocating..." if $verbose;
+    my $location = $geocoder->reverse_geocode(lat => $lat, lon => $long);
+    my $json = decode_json($geocoder->response->content);
+    if ($json->{error}) {
+      warn $json->{error} . " $lat/$long";
+      next; # FIXME
+    }
+    $city = $location->{address}->{city};
+    $cache{"$lat/$long"} = $city;
+    say "caching $lat/$long" if $verbose;
+  }
+  if ($city) {
+    rename("$dir/$file", "$dir/$date $city.jpg") or die "Cannot rename: $!";
+    $renamed++;
+  } else {
+    warn "No city!\n" if $verbose;
+  }
+}
+closedir $dh;
+warn "Renamed $renamed/$count files\n" if $renamed != $count or not $count;
